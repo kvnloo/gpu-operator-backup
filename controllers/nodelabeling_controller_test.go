@@ -40,6 +40,7 @@ import (
 
 	gpuv1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1"
 	nvidiav1alpha1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1alpha1"
+	"github.com/NVIDIA/gpu-operator/internal/coexistence"
 	"github.com/NVIDIA/gpu-operator/internal/consts"
 )
 
@@ -65,7 +66,7 @@ func TestNodeLabelingReconcileDefersDependentOperationsAfterGPULabelChanges(t *t
 	require.NoError(t, nvidiav1alpha1.AddToScheme(scheme))
 
 	clusterPolicy := &gpuv1.ClusterPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"},
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy", Finalizers: []string{nodeCleanupFinalizer}},
 		Spec: gpuv1.ClusterPolicySpec{
 			Driver: gpuv1.DriverSpec{
 				UseNvidiaDriverCRD: new(true),
@@ -122,7 +123,7 @@ func TestNodeLabelingReconcileDoesNotDeferDependentOperationsForStateLabelChange
 	require.NoError(t, nvidiav1alpha1.AddToScheme(scheme))
 
 	clusterPolicy := &gpuv1.ClusterPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"},
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy", Finalizers: []string{nodeCleanupFinalizer}},
 		Spec: gpuv1.ClusterPolicySpec{
 			Driver: gpuv1.DriverSpec{
 				UseNvidiaDriverCRD: new(true),
@@ -694,7 +695,7 @@ func TestUpdateGPUStateLabels(t *testing.T) {
 			}
 			labels := mergeLabels(tc.initialLabels)
 			expectedLabels := mergeLabels(tc.expectedLabels)
-			nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
+			nlc.updateGPUStateLabels(context.Background(), labels, "test-node", coexistence.DP)
 			assert.Equal(t, expectedLabels, labels)
 		})
 	}
@@ -702,29 +703,30 @@ func TestUpdateGPUStateLabels(t *testing.T) {
 
 func TestUpdateGPUStateLabelsDispatch(t *testing.T) {
 	clusterPolicy := &gpuv1.ClusterPolicy{}
-	gpuCluster := &nvidiav1alpha1.GPUCluster{}
 
 	tests := []struct {
 		name           string
 		clusterPolicy  *gpuv1.ClusterPolicy
-		gpuCluster     *nvidiav1alpha1.GPUCluster
+		stack          string
 		initialLabels  map[string]string
 		expectedLabels map[string]string
 	}{
 		{
 			name:           "GPUCluster gets the DRA deploy labels",
-			gpuCluster:     gpuCluster,
+			stack:          coexistence.DRA,
 			initialLabels:  map[string]string{commonGPULabelKey: commonGPULabelValue},
 			expectedLabels: mergeLabels(gpuClusterStateLabels),
 		},
 		{
 			name:           "ClusterPolicy gets the device-plugin deploy labels",
 			clusterPolicy:  clusterPolicy,
+			stack:          coexistence.DP,
 			initialLabels:  map[string]string{commonGPULabelKey: commonGPULabelValue},
 			expectedLabels: mergeLabels(gpuStateLabels[gpuWorkloadConfigContainer]),
 		},
 		{
 			name:           "no labels added without common GPU label present",
+			stack:          coexistence.DP,
 			initialLabels:  map[string]string{},
 			expectedLabels: map[string]string{},
 		},
@@ -735,12 +737,11 @@ func TestUpdateGPUStateLabelsDispatch(t *testing.T) {
 			nlc := &nodeLabelingController{
 				client:        fake.NewClientBuilder().WithIndex(&corev1.Pod{}, podNodeNameIndexKey, podNodeNameIndexer).Build(),
 				clusterPolicy: tc.clusterPolicy,
-				gpuCluster:    tc.gpuCluster,
 				logger:        logr.Discard(),
 			}
 			labels := tc.initialLabels
 			expected := mergeLabels(labels, tc.expectedLabels)
-			nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
+			nlc.updateGPUStateLabels(context.Background(), labels, "test-node", tc.stack)
 			assert.Equal(t, expected, labels)
 		})
 	}
@@ -748,31 +749,30 @@ func TestUpdateGPUStateLabelsDispatch(t *testing.T) {
 
 func TestUpdateGPUStateLabelsModeSweep(t *testing.T) {
 	clusterPolicy := &gpuv1.ClusterPolicy{}
-	gpuCluster := &nvidiav1alpha1.GPUCluster{}
 	gpuBase := map[string]string{commonGPULabelKey: commonGPULabelValue}
 
 	tests := []struct {
 		name           string
 		clusterPolicy  *gpuv1.ClusterPolicy
-		gpuCluster     *nvidiav1alpha1.GPUCluster
+		stack          string
 		initialLabels  map[string]string
 		expectedLabels map[string]string
 	}{
 		{
 			name:           "GPUCluster sweeps container-config leftovers, keeps shared keys",
-			gpuCluster:     gpuCluster,
+			stack:          coexistence.DRA,
 			initialLabels:  mergeLabels(gpuBase, gpuStateLabels[gpuWorkloadConfigContainer]),
 			expectedLabels: mergeLabels(gpuBase, gpuClusterStateLabels),
 		},
 		{
 			name:           "GPUCluster sweeps vm-passthrough leftovers",
-			gpuCluster:     gpuCluster,
+			stack:          coexistence.DRA,
 			initialLabels:  mergeLabels(gpuBase, gpuStateLabels[gpuWorkloadConfigVMPassthrough]),
 			expectedLabels: mergeLabels(gpuBase, gpuClusterStateLabels),
 		},
 		{
 			name:          "GPUCluster sweeps vm-vgpu leftovers but keeps the vgpu-manager driver gate",
-			gpuCluster:    gpuCluster,
+			stack:         coexistence.DRA,
 			initialLabels: mergeLabels(gpuBase, gpuStateLabels[gpuWorkloadConfigVMVgpu]),
 			expectedLabels: mergeLabels(gpuBase, gpuClusterStateLabels,
 				map[string]string{vgpuManagerDeployLabelKey: "true"}),
@@ -780,20 +780,21 @@ func TestUpdateGPUStateLabelsModeSweep(t *testing.T) {
 		{
 			name:           "ClusterPolicy sweeps DRA leftovers",
 			clusterPolicy:  clusterPolicy,
+			stack:          coexistence.DP,
 			initialLabels:  mergeLabels(gpuBase, gpuClusterStateLabels),
 			expectedLabels: mergeLabels(gpuBase, gpuStateLabels[gpuWorkloadConfigContainer]),
 		},
 		{
-			name:       "sweep never touches values of the node's own stack keys",
-			gpuCluster: gpuCluster,
+			name:  "sweep never touches values of the node's own stack keys",
+			stack: coexistence.DRA,
 			initialLabels: mergeLabels(gpuBase,
 				map[string]string{draDriverDeployLabelKey: "paused-for-driver-upgrade"}),
 			expectedLabels: mergeLabels(gpuBase, gpuClusterStateLabels,
 				map[string]string{draDriverDeployLabelKey: "paused-for-driver-upgrade"}),
 		},
 		{
-			name:       "sweep removes only other-stack keys, sparing unrecognized keys and the operands kill switch",
-			gpuCluster: gpuCluster,
+			name:  "sweep removes only other-stack keys, sparing unrecognized keys and the operands kill switch",
+			stack: coexistence.DRA,
 			initialLabels: mergeLabels(gpuBase, map[string]string{
 				"nvidia.com/gpu.deploy.nvsm": "true",
 				migManagerLabelKey:           "true",
@@ -813,11 +814,10 @@ func TestUpdateGPUStateLabelsModeSweep(t *testing.T) {
 			nlc := &nodeLabelingController{
 				client:        fake.NewClientBuilder().WithIndex(&corev1.Pod{}, podNodeNameIndexKey, podNodeNameIndexer).Build(),
 				clusterPolicy: tc.clusterPolicy,
-				gpuCluster:    tc.gpuCluster,
 				logger:        logr.Discard(),
 			}
 			labels := mergeLabels(tc.initialLabels)
-			nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
+			nlc.updateGPUStateLabels(context.Background(), labels, "test-node", tc.stack)
 			assert.Equal(t, tc.expectedLabels, labels)
 		})
 	}
@@ -868,7 +868,7 @@ func TestDeferDRAPluginRemoval(t *testing.T) {
 			logger:        logr.Discard(),
 		}
 		labels := flippedNodeLabels()
-		nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
+		nlc.updateGPUStateLabels(context.Background(), labels, "test-node", coexistence.DP)
 		assert.Equal(t, "true", labels[draDriverDeployLabelKey], "plugin label must survive while claim pods remain")
 		assert.NotContains(t, labels, draValidatorDeployLabelKey, "claim-holder operand labels sweep immediately")
 		assert.True(t, nlc.draPluginRemovalDeferred)
@@ -889,7 +889,7 @@ func TestDeferDRAPluginRemoval(t *testing.T) {
 			logger:        logr.Discard(),
 		}
 		labels := flippedNodeLabels()
-		nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
+		nlc.updateGPUStateLabels(context.Background(), labels, "test-node", coexistence.DP)
 		assert.Equal(t, "true", labels[draDriverDeployLabelKey], "plugin label must survive while admin-claim pods remain")
 		assert.True(t, nlc.draPluginRemovalDeferred)
 	})
@@ -901,7 +901,7 @@ func TestDeferDRAPluginRemoval(t *testing.T) {
 			logger:        logr.Discard(),
 		}
 		labels := flippedNodeLabels()
-		nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
+		nlc.updateGPUStateLabels(context.Background(), labels, "test-node", coexistence.DP)
 		assert.NotContains(t, labels, draDriverDeployLabelKey)
 		assert.False(t, nlc.draPluginRemovalDeferred)
 	})
@@ -917,7 +917,7 @@ func TestDeferDRAPluginRemoval(t *testing.T) {
 			logger:        logr.Discard(),
 		}
 		labels := flippedNodeLabels()
-		nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
+		nlc.updateGPUStateLabels(context.Background(), labels, "test-node", coexistence.DP)
 		assert.Equal(t, "true", labels[draDriverDeployLabelKey])
 		assert.True(t, nlc.draPluginRemovalDeferred)
 	})
@@ -1327,7 +1327,7 @@ func TestReconcileGPUClusterNodeLabels(t *testing.T) {
 	}
 
 	t.Run("GPUCluster present and no ClusterPolicy labels the GPU node with DRA stack", func(t *testing.T) {
-		gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
+		gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", Finalizers: []string{nodeCleanupFinalizer}}}
 		r, c := newReconciler(gc, gpuNode())
 
 		_, err := r.Reconcile(context.Background(), reconcile.Request{})
@@ -1343,7 +1343,7 @@ func TestReconcileGPUClusterNodeLabels(t *testing.T) {
 	})
 
 	t.Run("ClusterPolicy present and no GPUCluster labels the GPU node with device-plugin stack", func(t *testing.T) {
-		cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
+		cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy", Finalizers: []string{nodeCleanupFinalizer}}}
 		r, c := newReconciler(cp, gpuNode())
 
 		_, err := r.Reconcile(context.Background(), reconcile.Request{})
@@ -1412,7 +1412,8 @@ func TestSourcePredicates(t *testing.T) {
 			update: func(cp *gpuv1.ClusterPolicy) { cp.Finalizers = []string{"example.com/cleanup"} },
 		},
 		"cleanup finalizer added": {
-			update: func(cp *gpuv1.ClusterPolicy) { cp.Finalizers = []string{nodeCleanupFinalizer} },
+			update:     func(cp *gpuv1.ClusterPolicy) { cp.Finalizers = []string{nodeCleanupFinalizer} },
+			labelWatch: true,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
