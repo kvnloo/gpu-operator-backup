@@ -21,6 +21,7 @@ import (
 	"errors"
 	"maps"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/k8s-operator-libs/pkg/upgrade"
 	"github.com/go-logr/logr"
@@ -1316,7 +1317,7 @@ func TestReconcileGPUClusterNodeLabels(t *testing.T) {
 		require.NoError(t, corev1.AddToScheme(scheme))
 		require.NoError(t, gpuv1.AddToScheme(scheme))
 		require.NoError(t, nvidiav1alpha1.AddToScheme(scheme))
-		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithIndex(&corev1.Pod{}, podNodeNameIndexKey, podNodeNameIndexer).Build()
 		return &NodeLabelingReconciler{Client: c, Scheme: scheme, Log: logr.Discard()}, c
 	}
 	gpuNode := func() *corev1.Node {
@@ -1368,13 +1369,41 @@ func TestReconcileGPUClusterNodeLabels(t *testing.T) {
 		assert.NotContains(t, node.Labels, draDriverDeployLabelKey)
 	})
 
-	t.Run("both CRs present returns an error", func(t *testing.T) {
-		cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
-		gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
-		r, _ := newReconciler(cp, gc, gpuNode())
+	t.Run("ClusterPolicy wins equal timestamps and GPUCluster waits for adoption", func(t *testing.T) {
+		cp, gc := testSourceCP(), testSourceGC()
+		gc.CreationTimestamp = cp.CreationTimestamp
+		cp.Status.Conditions = nil
+		node := gpuNode()
+		r, c := newReconciler(cp, gc, node)
 
 		_, err := r.Reconcile(context.Background(), reconcile.Request{})
-		require.ErrorContains(t, err, "both ClusterPolicy and GPUCluster CRs exist")
+		require.NoError(t, err)
+		require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(node), node))
+		require.Equal(t, coexistence.DP, node.Annotations[coexistence.SelectionAnnotation])
+		require.Equal(t, "true", node.Labels[devicePluginDeployLabelKey])
+		require.NotContains(t, node.Labels, draDriverDeployLabelKey)
+	})
+
+	t.Run("newer rejected ClusterPolicy leaves DRA placement intact", func(t *testing.T) {
+		gc := testSourceGC()
+		cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-policy", CreationTimestamp: metav1.NewTime(gc.CreationTimestamp.Add(time.Second)),
+		}}
+		existing := selectedNode(coexistence.DRA)
+		updateGPUClusterStateLabels(existing.Labels)
+		fresh := gpuNode()
+		r, c := newReconciler(cp, gc, existing, fresh)
+
+		_, err := r.Reconcile(t.Context(), reconcile.Request{})
+		require.NoError(t, err)
+		for _, node := range []*corev1.Node{existing, fresh} {
+			require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(node), node))
+			require.Equal(t, coexistence.DRA, node.Annotations[coexistence.SelectionAnnotation])
+			for key, want := range gpuClusterStateLabels {
+				require.Equal(t, want, node.Labels[key], key)
+			}
+			require.NotContains(t, node.Labels, devicePluginDeployLabelKey)
+		}
 	})
 }
 
